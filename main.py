@@ -478,7 +478,6 @@ class HeartbeatSimulator:
             dx = target[0] - self.current_pos[0]
             dy = target[1] - self.current_pos[1]
             dist_target = math.hypot(dx, dy)
-            # 优化移动步长，降低刷新压力
             step = 0.00008 + (self.speed/100)*0.0003
             if dist_target < step:
                 self.distance_traveled += dist_target
@@ -539,7 +538,6 @@ def create_planning_map(center_gcj, points_gcj, obstacles_gcj, flight_history=No
         tiles = AMAP_VECTOR_URL
         attr = "高德矢量地图"
     m = folium.Map(location=[center_gcj[1], center_gcj[0]], zoom_start=16, tiles=tiles, attr=attr)
-    # 仅航线规划页面加载绘图控件
     if enable_draw:
         draw = plugins.Draw(
             export=True, position='topleft',
@@ -702,7 +700,7 @@ def main():
                     if len(poly_gcj)>=3:
                         st.session_state.pending_polygon = poly_gcj
                         st.success("已捕获多边形障碍物轮廓")
-    # ========== 页面2：飞行监控【已修改为3秒自动刷新】 ==========
+    # ========== 页面2：飞行监控（固定3秒自动刷新） ==========
     elif page == "📡 飞行监控":
         st.header("🛸 飞行实时画面 - 任务执行监控")
         ctrl_row = st.columns([3,1])
@@ -729,7 +727,7 @@ def main():
         with ctrl_row[1]:
             run_status = "运行中" if (st.session_state.simulation_running and not st.session_state.heartbeat_sim.paused) else "已暂停"
             st.info(f"仿真状态：{run_status}")
-        # 【核心修改：刷新间隔设置为3秒=3.0s】
+        # 固定3秒刷新间隔
         now_time = time.time()
         refresh_interval = 3.0
         auto_refresh = False
@@ -738,12 +736,10 @@ def main():
                 sim_data = st.session_state.heartbeat_sim.update_and_generate()
                 pos = [sim_data["lng"], sim_data["lat"]]
                 st.session_state.flight_history.append(pos)
-                # 限制轨迹最大200点，减少渲染压力
                 if len(st.session_state.flight_history) > 200:
                     st.session_state.flight_history.pop(0)
                 st.session_state.last_hb_time = now_time
                 auto_refresh = True
-        # 仅飞机位置更新时才重载页面，无变化不刷新
         if auto_refresh:
             st.rerun()
         # 状态指标
@@ -761,7 +757,6 @@ def main():
             map_col, log_col = st.columns([2,1])
             with map_col:
                 st.subheader("实时飞行地图")
-                # 监控页面关闭绘图控件，大幅降低渲染负载
                 m = create_planning_map(st.session_state.points_gcj['A'], st.session_state.points_gcj, st.session_state.obstacles_gcj, st.session_state.flight_history, st.session_state.planned_path, map_type, straight_blocked, safe_radius, enable_draw=False)
                 folium_static(m, width=620, height=420)
             with log_col:
@@ -798,7 +793,7 @@ def main():
                 with tab_up:
                     log_text = "\n".join(st.session_state.fcu2gcs_log) if st.session_state.fcu2gcs_log else "暂无回传日志"
                     st.text_area("", log_text, height=220)
-    # ========== 页面3：障碍物管理（JSON导入导出） ==========
+    # ========== 页面3：障碍物管理（完整无截断） ==========
     elif page == "🚧 障碍物管理":
         st.header("🚧 障碍物管理面板")
         st.info(f"当前障碍物总数：{len(st.session_state.obstacles_gcj)}")
@@ -826,7 +821,6 @@ def main():
                 st.rerun()
         with col_opt:
             st.subheader("JSON 文件导入 / 导出")
-            # 导出
             json_str = export_obstacles_json()
             st.download_button(
                 label="📤导出障碍物JSON文件",
@@ -835,5 +829,12 @@ def main():
                 mime="application/json",
                 use_container_width=True
             )
-            # 导入
             st.markdown("#### 导入JSON文件")
+            upload_file = st.file_uploader("上传obstacles_data.json", type="json")
+            if upload_file is not None:
+                file_content = upload_file.read().decode("utf-8")
+                if st.button("确认导入", use_container_width=True):
+                    import_obstacles_json(file_content)
+
+if __name__ == "__main__":
+    main()
