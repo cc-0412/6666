@@ -194,7 +194,7 @@ def generate_side_bypass_path(start, end, obstacles_gcj, flight_height, safe_rad
     ux = dx / length
     uy = dy / length
 
-    # 修复向量：左右绕行方向正确
+    # 左右绕行向量修复
     if side == 'left':
         perp_x = -uy
         perp_y = ux
@@ -603,7 +603,7 @@ def main():
     # 侧边栏
     st.sidebar.title("🎛️ 导航菜单")
     page = st.sidebar.radio("功能模块", ["🗺️ 航线规划", "📡 飞行监控", "🚧 障碍物管理"])
-    map_type_choice = st.sidebar.radio("地图类型", ["卫星影像", "矢量街道"], index=0)
+    map_type_choice = st.sidebar.radio("地图类型", ["卫星影像", "矢量街道"], index=1)
     map_type = "satellite" if map_type_choice == "卫星影像" else "vector"
     st.sidebar.markdown("---")
     st.sidebar.subheader("⚙️ 无人机参数")
