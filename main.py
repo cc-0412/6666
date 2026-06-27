@@ -702,7 +702,7 @@ def main():
                     if len(poly_gcj)>=3:
                         st.session_state.pending_polygon = poly_gcj
                         st.success("已捕获多边形障碍物轮廓")
-    # ========== 页面2：飞行监控（原生防抖自动刷新，关闭绘图控件防卡顿） ==========
+    # ========== 页面2：飞行监控【已修改为3秒自动刷新】 ==========
     elif page == "📡 飞行监控":
         st.header("🛸 飞行实时画面 - 任务执行监控")
         ctrl_row = st.columns([3,1])
@@ -729,9 +729,9 @@ def main():
         with ctrl_row[1]:
             run_status = "运行中" if (st.session_state.simulation_running and not st.session_state.heartbeat_sim.paused) else "已暂停"
             st.info(f"仿真状态：{run_status}")
-        # 原生防抖自动刷新逻辑，间隔250ms
+        # 【核心修改：刷新间隔设置为3秒=3.0s】
         now_time = time.time()
-        refresh_interval = 0.25
+        refresh_interval = 3.0
         auto_refresh = False
         if st.session_state.simulation_running and not st.session_state.heartbeat_sim.paused:
             if now_time - st.session_state.last_hb_time >= refresh_interval:
@@ -837,11 +837,3 @@ def main():
             )
             # 导入
             st.markdown("#### 导入JSON文件")
-            upload_file = st.file_uploader("上传obstacles_data.json", type="json")
-            if upload_file is not None:
-                file_content = upload_file.read().decode("utf-8")
-                if st.button("确认导入", use_container_width=True):
-                    import_obstacles_json(file_content)
-
-if __name__ == "__main__":
-    main()
