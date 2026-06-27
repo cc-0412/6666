@@ -1,5 +1,4 @@
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 import folium
 from streamlit_folium import folium_static, st_folium
 from folium import plugins
@@ -584,8 +583,6 @@ def create_planning_map(center_gcj, points_gcj, obstacles_gcj, flight_history=No
 # ==================== 主程序入口 ====================
 def main():
     init_comm_log()
-    # 全局自动刷新，飞行监控页面自动250ms刷新
-    st_autorefresh(interval=250, limit=None, key="global_auto_refresh")
     st.title("🏫 无人机地面站系统 - 平行偏移绕行")
     st.markdown("---")
     # SessionState初始化
@@ -705,7 +702,7 @@ def main():
                     if len(poly_gcj)>=3:
                         st.session_state.pending_polygon = poly_gcj
                         st.success("已捕获多边形障碍物轮廓")
-    # ========== 页面2：飞行监控（自动刷新，关闭绘图控件防卡顿） ==========
+    # ========== 页面2：飞行监控（原生防抖自动刷新，关闭绘图控件防卡顿） ==========
     elif page == "📡 飞行监控":
         st.header("🛸 飞行实时画面 - 任务执行监控")
         ctrl_row = st.columns([3,1])
@@ -732,13 +729,23 @@ def main():
         with ctrl_row[1]:
             run_status = "运行中" if (st.session_state.simulation_running and not st.session_state.heartbeat_sim.paused) else "已暂停"
             st.info(f"仿真状态：{run_status}")
-        # 自动更新飞机位置，无需手动rerun
+        # 原生防抖自动刷新逻辑，间隔250ms
+        now_time = time.time()
+        refresh_interval = 0.25
+        auto_refresh = False
         if st.session_state.simulation_running and not st.session_state.heartbeat_sim.paused:
-            sim_data = st.session_state.heartbeat_sim.update_and_generate()
-            pos = [sim_data["lng"], sim_data["lat"]]
-            st.session_state.flight_history.append(pos)
-            if len(st.session_state.flight_history) > 200:
-                st.session_state.flight_history.pop(0)
+            if now_time - st.session_state.last_hb_time >= refresh_interval:
+                sim_data = st.session_state.heartbeat_sim.update_and_generate()
+                pos = [sim_data["lng"], sim_data["lat"]]
+                st.session_state.flight_history.append(pos)
+                # 限制轨迹最大200点，减少渲染压力
+                if len(st.session_state.flight_history) > 200:
+                    st.session_state.flight_history.pop(0)
+                st.session_state.last_hb_time = now_time
+                auto_refresh = True
+        # 仅飞机位置更新时才重载页面，无变化不刷新
+        if auto_refresh:
+            st.rerun()
         # 状态指标
         if st.session_state.heartbeat_sim.history:
             latest = st.session_state.heartbeat_sim.history[0]
@@ -754,7 +761,7 @@ def main():
             map_col, log_col = st.columns([2,1])
             with map_col:
                 st.subheader("实时飞行地图")
-                # 监控页面关闭绘图控件，大幅提速
+                # 监控页面关闭绘图控件，大幅降低渲染负载
                 m = create_planning_map(st.session_state.points_gcj['A'], st.session_state.points_gcj, st.session_state.obstacles_gcj, st.session_state.flight_history, st.session_state.planned_path, map_type, straight_blocked, safe_radius, enable_draw=False)
                 folium_static(m, width=620, height=420)
             with log_col:
