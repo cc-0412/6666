@@ -1,4 +1,5 @@
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import folium
 from streamlit_folium import folium_static, st_folium
 from folium import plugins
@@ -6,16 +7,16 @@ import random
 import time
 import math
 import json
+import io
 from datetime import datetime, timedelta
 import copy
 import heapq
 import numpy as np
-import io
 
-# ==================== 页面配置 ====================
+# ==================== 页面基础配置 ====================
 st.set_page_config(page_title="无人机地面站系统 - 平行偏移绕行", layout="wide")
 
-# ==================== 坐标常量 GCJ02 ====================
+# ==================== GCJ02 坐标常量 ====================
 SCHOOL_CENTER_GCJ = [118.7490, 32.2340]
 DEFAULT_A_GCJ = [118.746956, 32.232945]
 DEFAULT_B_GCJ = [118.751589, 32.235204]
@@ -194,12 +195,11 @@ def generate_side_bypass_path(start, end, obstacles_gcj, flight_height, safe_rad
     ux = dx / length
     uy = dy / length
 
-    # 【修复核心】右绕行向量修正，不再反向
+    # 修复向量：左右绕行方向正确
     if side == 'left':
         perp_x = -uy
         perp_y = ux
     else:
-        # 真正向右垂直偏移
         perp_x = uy
         perp_y = -ux
 
@@ -379,7 +379,6 @@ def add_gcs_obc_fcu_log(msg):
     init_comm_log()
     t_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     st.session_state.gcs2fcu_log.append(f"[{t_str}] ✅ {msg}")
-    # 日志最多保留30条
     if len(st.session_state.gcs2fcu_log) > 30:
         st.session_state.gcs2fcu_log.pop(0)
 
@@ -403,7 +402,7 @@ def load_obstacles_from_cache():
     st.success(f"加载缓存 {len(st.session_state.obstacles_gcj)} 个障碍物")
     return True
 
-# ==================== 新增：障碍物JSON导入导出 ====================
+# ==================== 障碍物JSON导入导出 ====================
 def export_obstacles_json():
     buf = io.StringIO()
     json.dump(st.session_state.obstacles_gcj, buf, ensure_ascii=False, indent=2)
@@ -472,7 +471,6 @@ class HeartbeatSimulator:
         self.wp_logged = set()
 
     def update_and_generate(self):
-        # 卡死保护
         if not self.simulating or self.paused or self.path_index >= len(self.path)-1:
             self.simulating = False
             self.progress = 1.0
@@ -481,7 +479,8 @@ class HeartbeatSimulator:
             dx = target[0] - self.current_pos[0]
             dy = target[1] - self.current_pos[1]
             dist_target = math.hypot(dx, dy)
-            step = 0.00015 + (self.speed/100)*0.0005
+            # 优化移动步长，降低刷新压力
+            step = 0.00008 + (self.speed/100)*0.0003
             if dist_target < step:
                 self.distance_traveled += dist_target
                 self.current_pos = target.copy()
@@ -532,8 +531,8 @@ class HeartbeatSimulator:
             self.history.pop()
         return data
 
-# ==================== 地图渲染函数 ====================
-def create_planning_map(center_gcj, points_gcj, obstacles_gcj, flight_history=None, planned_path=None, map_type="satellite", straight_blocked=True, safe_radius=5):
+# ==================== 地图渲染函数（新增绘图开关） ====================
+def create_planning_map(center_gcj, points_gcj, obstacles_gcj, flight_history=None, planned_path=None, map_type="satellite", straight_blocked=True, safe_radius=5, enable_draw=True):
     if map_type == "satellite":
         tiles = ARCGIS_SATELLITE_URL
         attr = "ArcGIS卫星影像"
@@ -541,19 +540,20 @@ def create_planning_map(center_gcj, points_gcj, obstacles_gcj, flight_history=No
         tiles = AMAP_VECTOR_URL
         attr = "高德矢量地图"
     m = folium.Map(location=[center_gcj[1], center_gcj[0]], zoom_start=16, tiles=tiles, attr=attr)
-    draw = plugins.Draw(
-        export=True, position='topleft',
-        draw_options={'polygon': {'allowIntersection':False, 'showArea':True, 'color':'#ff0000','fillColor':'#ff0000','fillOpacity':0.4},
-                      'polyline':False, 'rectangle':False, 'circle':False, 'marker':False, 'circlemarker':False},
-        edit_options={'edit':True, 'remove':True}
-    )
-    m.add_child(draw)
+    # 仅航线规划页面加载绘图控件
+    if enable_draw:
+        draw = plugins.Draw(
+            export=True, position='topleft',
+            draw_options={'polygon': {'allowIntersection':False, 'showArea':True, 'color':'#ff0000','fillColor':'#ff0000','fillOpacity':0.4},
+                          'polyline':False, 'rectangle':False, 'circle':False, 'marker':False, 'circlemarker':False},
+            edit_options={'edit':True, 'remove':True}
+        )
+        m.add_child(draw)
     safe_offset_deg = safe_radius / DEG_TO_M
     for i, obs in enumerate(obstacles_gcj):
         poly = obs.get('polygon', [])
         if len(poly)<3:
             continue
-        # 安全半径散点标记
         for (x,y) in poly:
             for angle in range(0,360,30):
                 rad = math.radians(angle)
@@ -563,23 +563,19 @@ def create_planning_map(center_gcj, points_gcj, obstacles_gcj, flight_history=No
         poly_coords = [[c[1], c[0]] for c in poly]
         popup = f"🚧 {obs.get('name',f'障碍物{i+1}')}\n高度:{obs.get('height',20)}m"
         folium.Polygon(poly_coords, color="red", weight=3, fill=True, fill_color="red", fill_opacity=0.4, popup=popup).add_to(m)
-    # 起点终点标记
     if points_gcj.get('A'):
         folium.Marker([points_gcj['A'][1], points_gcj['A'][0]], popup="🟢起点A", icon=folium.Icon(color="green", icon="play", prefix="fa")).add_to(m)
     if points_gcj.get('B'):
         folium.Marker([points_gcj['B'][1], points_gcj['B'][0]], popup="🔴终点B", icon=folium.Icon(color="red", icon="stop", prefix="fa")).add_to(m)
-    # 规划航线
     if planned_path and len(planned_path)>1:
         path_loc = [[p[1], p[0]] for p in planned_path]
         folium.PolyLine(path_loc, color="green", weight=5, opacity=0.9, popup="✈️智能避障航线").add_to(m)
         for p in planned_path:
             folium.CircleMarker([p[1], p[0]], radius=3, color="green", fill=True, fill_color="white").add_to(m)
-    # 原始直线
     if points_gcj.get('A') and points_gcj.get('B'):
         line_color = "blue" if not straight_blocked else "gray"
         dash_pop = "直线畅通" if not straight_blocked else "⚠️直线被阻挡"
         folium.PolyLine([[points_gcj['A'][1], points_gcj['A'][0]], [points_gcj['B'][1], points_gcj['B'][0]]], color=line_color, weight=2, opacity=0.5, dash_array="5,5", popup=dash_pop).add_to(m)
-    # 飞行历史轨迹
     if flight_history and len(flight_history)>1:
         trail = [[p[1], p[0]] for p in flight_history]
         folium.PolyLine(trail, color="orange", weight=2, opacity=0.6, popup="实时飞行轨迹").add_to(m)
@@ -588,6 +584,8 @@ def create_planning_map(center_gcj, points_gcj, obstacles_gcj, flight_history=No
 # ==================== 主程序入口 ====================
 def main():
     init_comm_log()
+    # 全局自动刷新，飞行监控页面自动250ms刷新
+    st_autorefresh(interval=250, limit=None, key="global_auto_refresh")
     st.title("🏫 无人机地面站系统 - 平行偏移绕行")
     st.markdown("---")
     # SessionState初始化
@@ -697,17 +695,17 @@ def main():
                     st.session_state.points_gcj['A'], st.session_state.points_gcj['B'],
                     st.session_state.obstacles_gcj, flight_alt, safe_radius, selected_strategy
                 )
-            m = create_planning_map(center, st.session_state.points_gcj, st.session_state.obstacles_gcj, st.session_state.flight_history, st.session_state.planned_path, map_type, straight_blocked, safe_radius)
+            m = create_planning_map(center, st.session_state.points_gcj, st.session_state.obstacles_gcj, st.session_state.flight_history, st.session_state.planned_path, map_type, straight_blocked, safe_radius, enable_draw=True)
             map_out = st_folium(m, width=720, height=560, returned_objects=["last_active_drawing"])
             if map_out and map_out.get("last_active_drawing"):
                 draw_data = map_out["last_active_drawing"]
                 if draw_data["geometry"]["type"] == "Polygon":
                     coords_raw = draw_data["geometry"]["coordinates"][0]
-                    poly_gcj = [[p[0], p[1]] for p in coords_raw[:-1]] # 去除闭合重复点
+                    poly_gcj = [[p[0], p[1]] for p in coords_raw[:-1]]
                     if len(poly_gcj)>=3:
                         st.session_state.pending_polygon = poly_gcj
                         st.success("已捕获多边形障碍物轮廓")
-    # ========== 页面2：飞行监控（优化刷新防卡顿） ==========
+    # ========== 页面2：飞行监控（自动刷新，关闭绘图控件防卡顿） ==========
     elif page == "📡 飞行监控":
         st.header("🛸 飞行实时画面 - 任务执行监控")
         ctrl_row = st.columns([3,1])
@@ -719,39 +717,28 @@ def main():
                     st.session_state.heartbeat_sim.set_path(path, flight_alt, drone_speed)
                     st.session_state.simulation_running = True
                     st.session_state.flight_history = []
-                    st.rerun()
             with btn_pause:
                 if st.button("暂停", use_container_width=True):
                     st.session_state.heartbeat_sim.pause()
-                    st.rerun()
             with btn_stop:
                 if st.button("停止", use_container_width=True):
                     st.session_state.simulation_running = False
                     st.session_state.heartbeat_sim.stop()
-                    st.rerun()
             with btn_reset:
                 if st.button("重置", use_container_width=True):
                     st.session_state.heartbeat_sim.reset()
                     st.session_state.simulation_running = False
                     st.session_state.flight_history = []
-                    st.rerun()
         with ctrl_row[1]:
             run_status = "运行中" if (st.session_state.simulation_running and not st.session_state.heartbeat_sim.paused) else "已暂停"
             st.info(f"仿真状态：{run_status}")
-        # 心跳刷新逻辑（优化0.2秒间隔，限制轨迹点）
-        now_time = time.time()
-        auto_refresh = False
+        # 自动更新飞机位置，无需手动rerun
         if st.session_state.simulation_running and not st.session_state.heartbeat_sim.paused:
-            if now_time - st.session_state.last_hb_time >= 0.2:
-                sim_data = st.session_state.heartbeat_sim.update_and_generate()
-                pos = [sim_data["lng"], sim_data["lat"]]
-                st.session_state.flight_history.append(pos)
-                if len(st.session_state.flight_history) > 300:
-                    st.session_state.flight_history.pop(0)
-                st.session_state.last_hb_time = now_time
-                auto_refresh = True
-        if auto_refresh:
-            st.rerun()
+            sim_data = st.session_state.heartbeat_sim.update_and_generate()
+            pos = [sim_data["lng"], sim_data["lat"]]
+            st.session_state.flight_history.append(pos)
+            if len(st.session_state.flight_history) > 200:
+                st.session_state.flight_history.pop(0)
         # 状态指标
         if st.session_state.heartbeat_sim.history:
             latest = st.session_state.heartbeat_sim.history[0]
@@ -767,7 +754,8 @@ def main():
             map_col, log_col = st.columns([2,1])
             with map_col:
                 st.subheader("实时飞行地图")
-                m = create_planning_map(st.session_state.points_gcj['A'], st.session_state.points_gcj, st.session_state.obstacles_gcj, st.session_state.flight_history, st.session_state.planned_path, map_type, straight_blocked, safe_radius)
+                # 监控页面关闭绘图控件，大幅提速
+                m = create_planning_map(st.session_state.points_gcj['A'], st.session_state.points_gcj, st.session_state.obstacles_gcj, st.session_state.flight_history, st.session_state.planned_path, map_type, straight_blocked, safe_radius, enable_draw=False)
                 folium_static(m, width=620, height=420)
             with log_col:
                 st.subheader("📡 通信链路拓扑")
@@ -803,7 +791,7 @@ def main():
                 with tab_up:
                     log_text = "\n".join(st.session_state.fcu2gcs_log) if st.session_state.fcu2gcs_log else "暂无回传日志"
                     st.text_area("", log_text, height=220)
-    # ========== 页面3：障碍物管理（新增JSON导入导出） ==========
+    # ========== 页面3：障碍物管理（JSON导入导出） ==========
     elif page == "🚧 障碍物管理":
         st.header("🚧 障碍物管理面板")
         st.info(f"当前障碍物总数：{len(st.session_state.obstacles_gcj)}")
@@ -831,7 +819,7 @@ def main():
                 st.rerun()
         with col_opt:
             st.subheader("JSON 文件导入 / 导出")
-            # 导出功能
+            # 导出
             json_str = export_obstacles_json()
             st.download_button(
                 label="📤导出障碍物JSON文件",
@@ -840,7 +828,7 @@ def main():
                 mime="application/json",
                 use_container_width=True
             )
-            # 导入功能
+            # 导入
             st.markdown("#### 导入JSON文件")
             upload_file = st.file_uploader("上传obstacles_data.json", type="json")
             if upload_file is not None:
