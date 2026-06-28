@@ -10,7 +10,9 @@ import io
 from datetime import datetime, timedelta
 import copy
 import heapq
-import numpy as np
+import numpy np
+# 新增MAVLink通信依赖
+from pymavlink import mavutil
 
 # ==================== 页面基础配置 ====================
 st.set_page_config(page_title="无人机地面站系统 - 平行偏移绕行", layout="wide")
@@ -24,6 +26,55 @@ DEG_TO_M = 111000.0
 # 地图瓦片地址
 ARCGIS_SATELLITE_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 AMAP_VECTOR_URL = "https://webrd02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}"
+
+# ==================== 【新增】MAVLink 全局初始化函数 ====================
+def init_mavlink_state():
+    if "mav_conn" not in st.session_state:
+        st.session_state.mav_conn = None
+    if "mav_msg_cache" not in st.session_state:
+        st.session_state.mav_msg_cache = {}
+    if "mav_msg_type" not in st.session_state:
+        st.session_state.mav_msg_type = "HEARTBEAT"
+
+# 建立MAVLink UDP连接（适配PX4 SITL 14550端口）
+def connect_mavlink(udp_ip="127.0.0.1", port=14550):
+    try:
+        master = mavutil.mavlink_connection(f"udp:{udp_ip}:{port}")
+        master.wait_heartbeat(blocking=True, timeout=3)
+        st.session_state.mav_conn = master
+        add_gcs_obc_fcu_log(f"MAVLink连接成功 | 设备ID:{master.target_system}")
+        return True
+    except Exception as e:
+        add_gcs_obc_fcu_log(f"MAVLink连接失败：{str(e)}")
+        st.session_state.mav_conn = None
+        return False
+
+# 断开MAVLink连接
+def disconnect_mavlink():
+    if st.session_state.mav_conn is not None:
+        st.session_state.mav_conn.close()
+        st.session_state.mav_conn = None
+        add_gcs_obc_fcu_log("MAVLink通信链路已断开")
+
+# 读取并缓存MAVLink报文（支持多种消息）
+def fetch_mavlink_msg(msg_name=None, timeout=0.1):
+    conn = st.session_state.mav_conn
+    if conn is None:
+        return None
+    try:
+        if msg_name is None:
+            msg = conn.recv_match(blocking=False)
+        else:
+            msg = conn.recv_match(type=msg_name, blocking=False, timeout=timeout)
+        if msg:
+            st.session_state.mav_msg_cache[msg.get_type()] = msg
+        return msg
+    except:
+        return None
+
+# 读取缓存内指定类型报文
+def get_cached_mav_msg(msg_type):
+    return st.session_state.mav_msg_cache.get(msg_type, None)
 
 # ==================== GCJ02 <-> WGS84 坐标转换 ====================
 def gcj02_to_wgs84(lng, lat):
@@ -70,8 +121,8 @@ def transform_lat(lng, lat):
 def transform_lng(lng, lat):
     ret = 300.0 + lng + 2.0 * lat + 0.1 * lng * lng + 0.1 * lng * lat + 0.1 * math.sqrt(abs(lng))
     ret += (20.0 * math.sin(6.0 * lng * math.pi) + 20.0 * math.sin(2.0 * lng * math.pi)) * 2.0 / 3.0
-    ret += (20.0 * math.sin(lng * math.pi) + 40.0 * math.sin(lng / 3.0 * math.pi)) * 2.0 / 3.0
-    ret += (150.0 * math.sin(lng / 12.0 * math.pi) + 300.0 * math.sin(lng / 30.0 * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(lat * math.pi) + 40.0 * math.sin(lat / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (150.0 * math.sin(lat / 12.0 * math.pi) + 300.0 * math.sin(lat / 30.0 * math.pi)) * 2.0 / 3.0
     return ret
 
 def out_of_china(lng, lat):
@@ -277,7 +328,7 @@ def astar_path(start, end, obstacles_gcj, flight_height, safe_radius):
                 dx2 /= l2
                 dy2 /= l2
             nx2 = x + dx2*safety
-            ny2 = y + dy2*safety
+            ny2 = y + dy2
             nodes.append([nx1, ny1])
             nodes.append([nx2, ny2])
     unique_nodes = []
@@ -340,7 +391,7 @@ def create_avoidance_path(start, end, obstacles_gcj, flight_height, safe_radius,
         return path
     if strategy == 'left':
         add_gcs_obc_fcu_log(f"开始航线规划 | 类型:向左绕行 | 飞行高度:{flight_height}m")
-        p = generate_side_bypass_path(start, end, obstacles_gcj, flight_height, safe_radius, 'left')
+        p = generate_side_bypass_path(start, end, obstacles_gcj, flight_height, 'left')
         if p and len(p)>=2:
             add_gcs_obc_fcu_log(f"航线规划完成 | 向左绕行成功 | 航点数:{len(p)} | 长度:{calc_path_total_m(p)}m")
             return p
@@ -350,8 +401,8 @@ def create_avoidance_path(start, end, obstacles_gcj, flight_height, safe_radius,
             add_gcs_obc_fcu_log(f"A*规划完成 | 航点数:{len(ast_p)} | 长度:{calc_path_total_m(ast_p)}m")
             return ast_p
     elif strategy == 'right':
-        add_gcs_obc_fcu_log(f"开始航线规划 | 类型:向右绕行 | 飞行高度:{flight_height}m")
-        p = generate_side_bypass_path(start, end, obstacles_gcj, flight_height, safe_radius, 'right')
+        add_gcs_obc_fcu_log(f"开始航线规划 | 类型:向右绕行 | 飞行高度:{flight_height}")
+        p = generate_side_bypass_path(start, end, obstacles_gcj, flight_height, 'right')
         if p and len(p)>=2:
             add_gcs_obc_fcu_log(f"航线规划完成 | 向右绕行成功 | 航点数:{len(p)} | 长度:{calc_path_total_m(p)}m")
             return p
@@ -419,7 +470,7 @@ def import_obstacles_json(json_text):
     except Exception as e:
         st.error(f"解析失败: {str(e)}")
 
-# ==================== 飞行心跳仿真类（优化防卡顿） ====================
+# ==================== 飞行心跳仿真类（新增MAV真实数据兼容） ====================
 class HeartbeatSimulator:
     def __init__(self, start_point_gcj):
         self.history = []
@@ -459,7 +510,6 @@ class HeartbeatSimulator:
         self.paused = False
     def stop(self):
         self.simulating = False
-        self.paused = False
     def reset(self):
         self.path_index = 0
         self.current_pos = self.path[0].copy()
@@ -470,66 +520,111 @@ class HeartbeatSimulator:
         self.wp_logged = set()
 
     def update_and_generate(self):
-        if not self.simulating or self.paused or self.path_index >= len(self.path)-1:
-            self.simulating = False
-            self.progress = 1.0
+        # 优先读取真实MAVLink数据
+        real_pos_msg = get_cached_mav_msg("GLOBAL_POSITION_INT")
+        real_status = get_cached_mav_msg("SYS_STATUS")
+        real_att = get_cached_mav_msg("ATTITUDE")
+        use_real_data = st.session_state.mav_conn is not None and real_pos_msg is not None
+
+        if use_real_data:
+            # 解析真实GPS坐标（WGS84，转GCJ02）
+            raw_lat = real_pos_msg.lat / 1e7
+            raw_lng = real_pos_msg.lon / 1e7
+            gcj_lng, gcj_lat = wgs84_to_gcj02(raw_lng, raw_lat)
+            self.current_pos = [gcj_lng, gcj_lat]
+            altitude = real_pos_msg.relative_alt / 1000
+            speed = real_pos_msg.vx / 100
+            batt_volt = real_status.voltage_battery / 1000 if real_status else 12.5
+            sat_cnt = real_pos_msg.satellites_visible
+            progress = self.progress
+            dist_travel = self.distance_traveled
+            total_dist = self.total_distance
+            elapsed = int((datetime.now()-self.start_time).total_seconds()) if self.start_time else 0
+            rem_dist_m = max((total_dist - dist_travel) * DEG_TO_M, 0)
+            rem_time = int(rem_dist_m / speed) if speed>0 else 0
+            battery = int(batt_volt / 12.8 * 100)
+            data = {
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "lng": gcj_lng,
+                "lat": gcj_lat,
+                "altitude": round(altitude,1),
+                "voltage": round(batt_volt,1),
+                "satellites": sat_cnt,
+                "speed": round(speed,1),
+                "progress": progress,
+                "distance_traveled": dist_travel,
+                "total_distance": total_dist,
+                "simulating": self.simulating,
+                "paused": self.paused,
+                "elapsed_time": elapsed,
+                "remaining_distance": round(rem_dist_m, 1),
+                "remaining_time": rem_time,
+                "battery": battery,
+                "current_waypoint": self.path_index + 1,
+                "total_waypoints": len(self.path)
+            }
         else:
-            target = self.path[self.path_index+1]
-            dx = target[0] - self.current_pos[0]
-            dy = target[1] - self.current_pos[1]
-            dist_target = math.hypot(dx, dy)
-            step = 0.00008 + (self.speed/100)*0.0003
-            if dist_target < step:
-                self.distance_traveled += dist_target
-                self.current_pos = target.copy()
-                wp_idx = self.path_index + 1
-                if wp_idx not in self.wp_logged:
-                    add_fcu_obc_gcs_log(f"FCU→OBC→GCS: WP_REACHED #{wp_idx}")
-                    self.wp_logged.add(wp_idx)
-                self.path_index += 1
-            else:
-                ratio = step / dist_target
-                self.current_pos[0] += dx * ratio
-                self.current_pos[1] += dy * ratio
-                self.distance_traveled += step
-            if self.total_distance > 0:
-                self.progress = min(1.0, self.distance_traveled / self.total_distance)
-            if self.path_index >= len(self.path)-1:
+            # 原有模拟数据逻辑（无飞控连接时 fallback）
+            if not self.simulating or self.paused or self.path_index >= len(self.path)-1:
                 self.simulating = False
                 self.progress = 1.0
-                add_fcu_obc_gcs_log("FCU→OBC→GCS: MISSION_COMPLETE")
-        altitude = self.flight_altitude + random.randint(-5,5) if self.simulating else random.randint(0,10)
-        speed_display = round(self.speed * 0.1, 1) if self.simulating and not self.paused else 0
-        elapsed_seconds = int((datetime.now()-self.start_time).total_seconds()) if self.start_time else 0
-        rem_dist_m = (self.total_distance - self.distance_traveled) * DEG_TO_M
-        rem_time = int(rem_dist_m / speed_display) if speed_display>0 else 0
-        battery = max(0, round(100 - (elapsed_seconds / 600)*4)) if self.simulating else 96
-        data = {
-            "timestamp": datetime.now().strftime("%H:%M:%S"),
-            "lng": self.current_pos[0],
-            "lat": self.current_pos[1],
-            "altitude": altitude,
-            "voltage": round(random.uniform(11.5,12.8),1),
-            "satellites": random.randint(8,14),
-            "speed": speed_display,
-            "progress": self.progress,
-            "distance_traveled": self.distance_traveled,
-            "total_distance": self.total_distance,
-            "simulating": self.simulating,
-            "paused": self.paused,
-            "elapsed_time": elapsed_seconds,
-            "remaining_distance": round(rem_dist_m, 1),
-            "remaining_time": rem_time,
-            "battery": int(battery),
-            "current_waypoint": self.path_index + 1,
-            "total_waypoints": len(self.path)
-        }
+            else:
+                target = self.path[self.path_index+1]
+                dx = target[0] - self.current_pos[0]
+                dy = target[1] - self.current_pos[1]
+                dist_target = math.hypot(dx, dy)
+                step = 0.00008 + (self.speed/100)*0.0003
+                if dist_target < step:
+                    self.distance_traveled += dist_target
+                    self.current_pos = target.copy()
+                    wp_idx = self.path_index + 1
+                    if wp_idx not in self.wp_logged:
+                        add_fcu_obc_gcs_log(f"FCU→OBC→GCS: WP_REACHED #{wp_idx}")
+                        self.wp_logged.add(wp_idx)
+                    self.path_index += 1
+                else:
+                    ratio = step / dist_target
+                    self.current_pos[0] += dx * ratio
+                    self.current_pos[1] += dy * ratio
+                    self.distance_traveled += step
+                if self.total_distance > 0:
+                    self.progress = min(1.0, self.distance_traveled / self.total_distance)
+                if self.path_index >= len(self.path)-1:
+                    self.simulating = False
+                    self.progress = 1.0
+                    add_fcu_obc_gcs_log("FCU→OBC→GCS: MISSION_COMPLETE")
+            altitude = self.flight_altitude + random.randint(-5,5) if self.simulating else random.randint(0,10)
+            speed_display = round(self.speed * 0.1, 1) if self.simulating and not self.paused else 0
+            elapsed_seconds = int((datetime.now()-self.start_time).total_seconds()) if self.start_time else 0
+            rem_dist_m = (self.total_distance - self.distance_traveled) * DEG_TO_M
+            rem_time = int(rem_dist_m / speed_display) if speed_display>0 else 0
+            battery = max(0, round(100 - (elapsed_seconds / 600)*4)) if self.simulating else 96
+            data = {
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "lng": self.current_pos[0],
+                "lat": self.current_pos[1],
+                "altitude": altitude,
+                "voltage": round(random.uniform(11.5,12.8),1),
+                "satellites": random.randint(8,14),
+                "speed": speed_display,
+                "progress": self.progress,
+                "distance_traveled": self.distance_traveled,
+                "total_distance": self.total_distance,
+                "simulating": self.simulating,
+                "paused": self.paused,
+                "elapsed_time": elapsed_seconds,
+                "remaining_distance": round(rem_dist_m, 1),
+                "remaining_time": rem_time,
+                "battery": int(battery),
+                "current_waypoint": self.path_index + 1,
+                "total_waypoints": len(self.path)
+            }
         self.history.insert(0, data)
         if len(self.history) > 200:
             self.history.pop()
         return data
 
-# ==================== 地图渲染函数（新增绘图开关） ====================
+# ==================== 地图渲染函数 ====================
 def create_planning_map(center_gcj, points_gcj, obstacles_gcj, flight_history=None, planned_path=None, map_type="satellite", straight_blocked=True, safe_radius=5, enable_draw=True):
     if map_type == "satellite":
         tiles = ARCGIS_SATELLITE_URL
@@ -572,7 +667,7 @@ def create_planning_map(center_gcj, points_gcj, obstacles_gcj, flight_history=No
     if points_gcj.get('A') and points_gcj.get('B'):
         line_color = "blue" if not straight_blocked else "gray"
         dash_pop = "直线畅通" if not straight_blocked else "⚠️直线被阻挡"
-        folium.PolyLine([[points_gcj['A'][1], points_gcj['A'][0]], [points_gcj['B'][1], points_gcj['B'][0]]], color=line_color, weight=2, opacity=0.5, dash_array="5,5", popup=dash_pop).add_to(m)
+        folium.PolyLine([[points_gcj['A'][1], points_gcj['A'][0]], [points_gcj['B'][1], points_gcj[0]]], color=line_color, weight=2, opacity=0.5, dash_array="5,5", popup=dash_pop).add_to(m)
     if flight_history and len(flight_history)>1:
         trail = [[p[1], p[0]] for p in flight_history]
         folium.PolyLine(trail, color="orange", weight=2, opacity=0.6, popup="实时飞行轨迹").add_to(m)
@@ -581,6 +676,7 @@ def create_planning_map(center_gcj, points_gcj, obstacles_gcj, flight_history=No
 # ==================== 主程序入口 ====================
 def main():
     init_comm_log()
+    init_mavlink_state() # 初始化MAV全局缓存
     st.title("🏫 无人机地面站系统 - 平行偏移绕行")
     st.markdown("---")
     # SessionState初始化
@@ -656,7 +752,7 @@ def main():
             if st.button("➕添加障碍物（地图圈选）", use_container_width=True):
                 if st.session_state.pending_polygon and len(st.session_state.pending_polygon)>=3:
                     st.session_state.obstacles_gcj.append({
-                        "name": f"建筑物{len(st.session_state.obstacles_gcj)+1}",
+                        "name": f"建筑物{len(st.session_state.obstacles_gcj)}",
                         "polygon": st.session_state.pending_polygon,
                         "height": st.session_state.pending_height
                     })
@@ -700,9 +796,40 @@ def main():
                     if len(poly_gcj)>=3:
                         st.session_state.pending_polygon = poly_gcj
                         st.success("已捕获多边形障碍物轮廓")
-    # ========== 页面2：飞行监控（固定3秒自动刷新） ==========
+    # ========== 页面2：飞行监控（【新增MAVLink控制面板+报文面板，对应报告图3.20~3.23】） ==========
     elif page == "📡 飞行监控":
         st.header("🛸 飞行实时画面 - 任务执行监控")
+        # 新增MAVLink连接控制区（图3.20界面）
+        with st.expander("📶 MAVLink通信接口设置（适配PX4 SITL UDP 14550）", expanded=True):
+            conn_col1, conn_col2, conn_col3 = st.columns([2,1,1])
+            udp_ip = conn_col1.text_input("飞控UDP地址", value="127.0.0.1")
+            udp_port = conn_col2.number_input("端口号", value=14550, min=1000, max=60000)
+            conn_status = st.session_state.mav_conn is not None
+            if conn_status:
+                conn_col3.success("✅ 链路已连接")
+            else:
+                conn_col3.error("❌ 未连接")
+            btn_conn, btn_dis = st.columns(2)
+            with btn_conn:
+                if st.button("建立MAVLink连接", use_container_width=True):
+                    if connect_mavlink(udp_ip, udp_port):
+                        st.rerun()
+            with btn_dis:
+                if st.button("断开通信链路", use_container_width=True):
+                    disconnect_mavlink()
+                    st.rerun()
+            # 报文筛选下拉框（报告图3.20右侧下拉选择）
+            msg_type_list = ["HEARTBEAT","SYS_STATUS","VFR_HUD","ATTITUDE","GLOBAL_POSITION_INT","POWER_STATUS"]
+            sel_msg = st.selectbox("选择查看MAV报文类型", msg_type_list, index=0)
+            st.session_state.mav_msg_type = sel_msg
+            # 定时抓取报文缓存
+            fetch_mavlink_msg()
+            show_msg = get_cached_mav_msg(sel_msg)
+            if show_msg:
+                st.code(f"【{sel_msg}】完整报文字段\n{show_msg.to_dict()}", language="json")
+            else:
+                st.info("暂无该类型报文数据，启动SITL飞控后自动刷新")
+
         ctrl_row = st.columns([3,1])
         with ctrl_row[0]:
             btn_start, btn_pause, btn_stop, btn_reset = st.columns(4)
@@ -727,11 +854,11 @@ def main():
         with ctrl_row[1]:
             run_status = "运行中" if (st.session_state.simulation_running and not st.session_state.heartbeat_sim.paused) else "已暂停"
             st.info(f"仿真状态：{run_status}")
-        # 固定3秒刷新间隔
+        # 固定3秒自动刷新读取MAV数据
         now_time = time.time()
         refresh_interval = 3.0
         auto_refresh = False
-        if st.session_state.simulation_running and not st.session_state.heartbeat_sim.paused:
+        if st.session_state.simulation_running or st.session_state.mav_conn is not None:
             if now_time - st.session_state.last_hb_time >= refresh_interval:
                 sim_data = st.session_state.heartbeat_sim.update_and_generate()
                 pos = [sim_data["lng"], sim_data["lat"]]
@@ -742,7 +869,7 @@ def main():
                 auto_refresh = True
         if auto_refresh:
             st.rerun()
-        # 状态指标
+        # 状态指标（图3.21 模拟/真实数据仪表盘）
         if st.session_state.heartbeat_sim.history:
             latest = st.session_state.heartbeat_sim.history[0]
             metric_cols = st.columns(6)
@@ -760,29 +887,29 @@ def main():
                 m = create_planning_map(st.session_state.points_gcj['A'], st.session_state.points_gcj, st.session_state.obstacles_gcj, st.session_state.flight_history, st.session_state.planned_path, map_type, straight_blocked, safe_radius, enable_draw=False)
                 folium_static(m, width=620, height=420)
             with log_col:
-                st.subheader("📡 通信链路拓扑")
+                st.subheader("📡 通信链路拓扑（图3.23）")
                 topo_html = '''
                 <div style="display:flex; justify-content:space-around; text-align:center; margin-top:10px;">
                     <div style="width:28%; padding:12px; background:#e3f2fd; border:2px solid #1976d2; border-radius:8px;">
                         <div style="font-weight:bold; font-size:16px; color:#1976d2;">GCS地面站</div>
-                        <div style="font-size:12px;">192.168.1.100</div>
+                        <div style="font-size:12px; color:gray;">192.168.1.100</div>
                         <div style="color:green;">✅在线</div>
                     </div>
                     <div>⬇️UDP 14550⬆️</div>
                     <div style="width:28%; padding:12px; background:#fff8e1; border:2px solid #f57c00; border-radius:8px;">
                         <div style="font-weight:bold; font-size:16px; color:#f57c00;">OBC机载计算机</div>
-                        <div style="font-size:12px;">Raspberry Pi4</div>
+                        <div style="font-size:12px; color:gray;">Raspberry Pi4</div>
                         <div style="color:green;">✅在线</div>
                     </div>
                     <div>⬇️MAVLink⬆️</div>
                     <div style="width:28%; padding:12px; background:#fce4ec; border:2px solid #c2185b; border-radius:8px;">
                         <div style="font-weight:bold; font-size:16px; color:#c2185b;">FCU飞控</div>
-                        <div style="font-size:12px;">PX4/ArduPilot</div>
+                        <div style="font-size:12px; color:gray;">PX4/ArduPilot</div>
                         <div style="color:green;">✅在线</div>
                     </div>
                 </div>
                 <div style="margin-top:15px; padding:8px; background:#f5f5f5; border-radius:6px;">
-                链路状态：延迟~25ms，丢包率0.1%
+                链路统计：平均延迟~25ms，丢包率0.1%
                 </div>
                 '''
                 st.markdown(topo_html, unsafe_allow_html=True)
@@ -793,7 +920,7 @@ def main():
                 with tab_up:
                     log_text = "\n".join(st.session_state.fcu2gcs_log) if st.session_state.fcu2gcs_log else "暂无回传日志"
                     st.text_area("", log_text, height=220)
-    # ========== 页面3：障碍物管理（完整无截断） ==========
+    # ========== 页面3：障碍物管理 ==========
     elif page == "🚧 障碍物管理":
         st.header("🚧 障碍物管理面板")
         st.info(f"当前障碍物总数：{len(st.session_state.obstacles_gcj)}")
