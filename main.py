@@ -10,10 +10,16 @@ import io
 from datetime import datetime, timedelta
 import copy
 import heapq
-# 修复语法错误：补充as关键字
 import numpy as np
-# 新增MAVLink通信依赖
-from pymavlink import mavutil
+
+# 兼容处理：pymavlink缺失不崩溃，自动切换纯仿真模式
+MAV_AVAILABLE = False
+mavutil = None
+try:
+    from pymavlink import mavutil
+    MAV_AVAILABLE = True
+except ModuleNotFoundError:
+    MAV_AVAILABLE = False
 
 # ==================== 页面基础配置 ====================
 st.set_page_config(page_title="无人机地面站系统 - 平行偏移绕行", layout="wide")
@@ -28,7 +34,7 @@ DEG_TO_M = 111000.0
 ARCGIS_SATELLITE_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 AMAP_VECTOR_URL = "https://webrd02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}"
 
-# ==================== 【新增】MAVLink 全局初始化函数 ====================
+# ==================== MAVLink 工具函数（仅库存在时生效） ====================
 def init_mavlink_state():
     if "mav_conn" not in st.session_state:
         st.session_state.mav_conn = None
@@ -37,8 +43,10 @@ def init_mavlink_state():
     if "mav_msg_type" not in st.session_state:
         st.session_state.mav_msg_type = "HEARTBEAT"
 
-# 建立MAVLink UDP连接（适配PX4 SITL 14550端口）
 def connect_mavlink(udp_ip="127.0.0.1", port=14550):
+    if not MAV_AVAILABLE:
+        add_gcs_obc_fcu_log("⚠️未安装pymavlink，无法连接飞控")
+        return False
     try:
         master = mavutil.mavlink_connection(f"udp:{udp_ip}:{port}")
         master.wait_heartbeat(blocking=True, timeout=3)
@@ -50,18 +58,16 @@ def connect_mavlink(udp_ip="127.0.0.1", port=14550):
         st.session_state.mav_conn = None
         return False
 
-# 断开MAVLink连接
 def disconnect_mavlink():
     if st.session_state.mav_conn is not None:
         st.session_state.mav_conn.close()
         st.session_state.mav_conn = None
         add_gcs_obc_fcu_log("MAVLink通信链路已断开")
 
-# 读取并缓存MAVLink报文（支持多种消息）
 def fetch_mavlink_msg(msg_name=None, timeout=0.1):
-    conn = st.session_state.mav_conn
-    if conn is None:
+    if not MAV_AVAILABLE or st.session_state.mav_conn is None:
         return None
+    conn = st.session_state.mav_conn
     try:
         if msg_name is None:
             msg = conn.recv_match(blocking=False)
@@ -73,8 +79,9 @@ def fetch_mavlink_msg(msg_name=None, timeout=0.1):
     except:
         return None
 
-# 读取缓存内指定类型报文
 def get_cached_mav_msg(msg_type):
+    if not MAV_AVAILABLE:
+        return None
     return st.session_state.mav_msg_cache.get(msg_type, None)
 
 # ==================== GCJ02 <-> WGS84 坐标转换 ====================
@@ -232,7 +239,7 @@ def is_path_blocked(p1, p2, obstacles_gcj, flight_height):
                     return True
     return False
 
-# ==================== 修复：单侧平行偏移绕行（左右向量纠正） ====================
+# ==================== 单侧平行偏移绕行 ====================
 def generate_side_bypass_path(start, end, obstacles_gcj, flight_height, safe_radius, side='left'):
     block_obs = [obs for obs in obstacles_gcj if is_obstacle_blocking(obs, flight_height)]
     if not block_obs:
@@ -246,7 +253,6 @@ def generate_side_bypass_path(start, end, obstacles_gcj, flight_height, safe_rad
     ux = dx / length
     uy = dy / length
 
-    # 左右绕行向量修复
     if side == 'left':
         perp_x = -uy
         perp_y = ux
@@ -284,7 +290,6 @@ def generate_side_bypass_path(start, end, obstacles_gcj, flight_height, safe_rad
     if not collision:
         smooth = catmull_rom_spline(path, 8)
         return simplify_path_by_distance(smooth)
-    # 放大偏移重试
     for scale in [4,5,6,7,8,10]:
         offset_distance = max_dist_to_center + safe_radius_deg * scale
         offset_point = [avg_cx + perp_x*offset_distance, avg_cy + perp_y*offset_distance]
@@ -471,7 +476,7 @@ def import_obstacles_json(json_text):
     except Exception as e:
         st.error(f"解析失败: {str(e)}")
 
-# ==================== 飞行心跳仿真类（新增MAV真实数据兼容） ====================
+# ==================== 飞行仿真类（自动区分真实MAV/模拟数据） ====================
 class HeartbeatSimulator:
     def __init__(self, start_point_gcj):
         self.history = []
@@ -521,14 +526,11 @@ class HeartbeatSimulator:
         self.wp_logged = set()
 
     def update_and_generate(self):
-        # 优先读取真实MAVLink数据
         real_pos_msg = get_cached_mav_msg("GLOBAL_POSITION_INT")
         real_status = get_cached_mav_msg("SYS_STATUS")
-        real_att = get_cached_mav_msg("ATTITUDE")
-        use_real_data = st.session_state.mav_conn is not None and real_pos_msg is not None
+        use_real_data = MAV_AVAILABLE and st.session_state.mav_conn is not None and real_pos_msg is not None
 
         if use_real_data:
-            # 解析真实GPS坐标（WGS84，转GCJ02）
             raw_lat = real_pos_msg.lat / 1e7
             raw_lng = real_pos_msg.lon / 1e7
             gcj_lng, gcj_lat = wgs84_to_gcj02(raw_lng, raw_lat)
@@ -565,7 +567,6 @@ class HeartbeatSimulator:
                 "total_waypoints": len(self.path)
             }
         else:
-            # 原有模拟数据逻辑（无飞控连接时 fallback）
             if not self.simulating or self.paused or self.path_index >= len(self.path)-1:
                 self.simulating = False
                 self.progress = 1.0
@@ -677,10 +678,9 @@ def create_planning_map(center_gcj, points_gcj, obstacles_gcj, flight_history=No
 # ==================== 主程序入口 ====================
 def main():
     init_comm_log()
-    init_mavlink_state() # 初始化MAV全局缓存
+    init_mavlink_state()
     st.title("🏫 无人机地面站系统 - 平行偏移绕行")
     st.markdown("---")
-    # SessionState初始化
     init_vars = {
         "points_gcj": {'A':DEFAULT_A_GCJ.copy(), 'B':DEFAULT_B_GCJ.copy()},
         "obstacles_gcj": [],
@@ -723,7 +723,7 @@ def main():
             st.session_state.obstacles_gcj, flight_alt, safe_radius, selected_strategy
         )
         st.rerun()
-    # ========== 页面1：航线规划 ==========
+    # 航线规划页面
     if page == "🗺️ 航线规划":
         st.header("🗺️ 航线规划 - 智能避障")
         if straight_blocked:
@@ -797,39 +797,40 @@ def main():
                     if len(poly_gcj)>=3:
                         st.session_state.pending_polygon = poly_gcj
                         st.success("已捕获多边形障碍物轮廓")
-    # ========== 页面2：飞行监控（MAVLink通信接口完整面板） ==========
+    # 飞行监控页面（无pymavlink自动隐藏MAV面板，纯仿真可用）
     elif page == "📡 飞行监控":
         st.header("🛸 飞行实时画面 - 任务执行监控")
-        # MAVLink通信接口设置面板（报告图3.20）
-        with st.expander("📶 MAVLink通信接口设置（适配PX4 SITL UDP 14550）", expanded=True):
-            conn_col1, conn_col2, conn_col3 = st.columns([2,1,1])
-            udp_ip = conn_col1.text_input("飞控UDP地址", value="127.0.0.1")
-            udp_port = conn_col2.number_input("端口号", value=14550, min_value=1000, max_value=60000)
-            conn_status = st.session_state.mav_conn is not None
-            if conn_status:
-                conn_col3.success("✅ 链路已连接")
-            else:
-                conn_col3.error("❌ 未连接")
-            btn_conn, btn_dis = st.columns(2)
-            with btn_conn:
-                if st.button("建立MAVLink连接", use_container_width=True):
-                    if connect_mavlink(udp_ip, udp_port):
+        # 仅当pymavlink安装后才显示MAV通信面板
+        if MAV_AVAILABLE:
+            with st.expander("📶 MAVLink通信接口设置（适配PX4 SITL UDP 14550）", expanded=True):
+                conn_col1, conn_col2, conn_col3 = st.columns([2,1,1])
+                udp_ip = conn_col1.text_input("飞控UDP地址", value="127.0.0.1")
+                udp_port = conn_col2.number_input("端口号", value=14550, min_value=1000, max_value=60000)
+                conn_status = st.session_state.mav_conn is not None
+                if conn_status:
+                    conn_col3.success("✅ 链路已连接")
+                else:
+                    conn_col3.error("❌ 未连接")
+                btn_conn, btn_dis = st.columns(2)
+                with btn_conn:
+                    if st.button("建立MAVLink连接", use_container_width=True):
+                        if connect_mavlink(udp_ip, udp_port):
+                            st.rerun()
+                with btn_dis:
+                    if st.button("断开通信链路", use_container_width=True):
+                        disconnect_mavlink()
                         st.rerun()
-            with btn_dis:
-                if st.button("断开通信链路", use_container_width=True):
-                    disconnect_mavlink()
-                    st.rerun()
-            # 报文类型下拉选择
-            msg_type_list = ["HEARTBEAT","SYS_STATUS","VFR_HUD","ATTITUDE","GLOBAL_POSITION_INT","POWER_STATUS"]
-            sel_msg = st.selectbox("选择查看MAV报文类型", msg_type_list, index=0)
-            st.session_state.mav_msg_type = sel_msg
-            # 实时抓取报文
-            fetch_mavlink_msg()
-            show_msg = get_cached_mav_msg(sel_msg)
-            if show_msg:
-                st.code(f"【{sel_msg}】完整报文字段\n{show_msg.to_dict()}", language="json")
-            else:
-                st.info("暂无该类型报文数据，启动SITL飞控后自动刷新")
+                msg_type_list = ["HEARTBEAT","SYS_STATUS","VFR_HUD","ATTITUDE","GLOBAL_POSITION_INT","POWER_STATUS"]
+                sel_msg = st.selectbox("选择查看MAV报文类型", msg_type_list, index=0)
+                st.session_state.mav_msg_type = sel_msg
+                fetch_mavlink_msg()
+                show_msg = get_cached_mav_msg(sel_msg)
+                if show_msg:
+                    st.code(f"【{sel_msg}】完整报文字段\n{show_msg.to_dict()}", language="json")
+                else:
+                    st.info("暂无该类型报文数据，启动SITL飞控后自动刷新")
+        else:
+            st.info("💡当前环境未安装pymavlink，仅启用模拟飞行数据，如需真实飞控连接请安装依赖")
 
         ctrl_row = st.columns([3,1])
         with ctrl_row[0]:
@@ -855,11 +856,10 @@ def main():
         with ctrl_row[1]:
             run_status = "运行中" if (st.session_state.simulation_running and not st.session_state.heartbeat_sim.paused) else "已暂停"
             st.info(f"仿真状态：{run_status}")
-        # 3秒自动刷新读取MAV数据
         now_time = time.time()
         refresh_interval = 3.0
         auto_refresh = False
-        if st.session_state.simulation_running or st.session_state.mav_conn is not None:
+        if st.session_state.simulation_running or (MAV_AVAILABLE and st.session_state.mav_conn is not None):
             if now_time - st.session_state.last_hb_time >= refresh_interval:
                 sim_data = st.session_state.heartbeat_sim.update_and_generate()
                 pos = [sim_data["lng"], sim_data["lat"]]
@@ -870,7 +870,6 @@ def main():
                 auto_refresh = True
         if auto_refresh:
             st.rerun()
-        # 飞行数据仪表盘（图3.21/3.22，兼容真实MAV/模拟数据）
         if st.session_state.heartbeat_sim.history:
             latest = st.session_state.heartbeat_sim.history[0]
             metric_cols = st.columns(6)
@@ -888,7 +887,7 @@ def main():
                 m = create_planning_map(st.session_state.points_gcj['A'], st.session_state.points_gcj, st.session_state.obstacles_gcj, st.session_state.flight_history, st.session_state.planned_path, map_type, straight_blocked, safe_radius, enable_draw=False)
                 folium_static(m, width=620, height=420)
             with log_col:
-                st.subheader("📡 通信链路拓扑（图3.23）")
+                st.subheader("📡 通信链路拓扑")
                 topo_html = '''
                 <div style="display:flex; justify-content:space-around; text-align:center; margin-top:10px;">
                     <div style="width:28%; padding:12px; background:#e3f2fd; border:2px solid #1976d2; border-radius:8px;">
@@ -921,7 +920,7 @@ def main():
                 with tab_up:
                     log_text = "\n".join(st.session_state.fcu2gcs_log) if st.session_state.fcu2gcs_log else "暂无回传日志"
                     st.text_area("", log_text, height=220)
-    # ========== 页面3：障碍物管理 ==========
+    # 障碍物管理页面
     elif page == "🚧 障碍物管理":
         st.header("🚧 障碍物管理面板")
         st.info(f"当前障碍物总数：{len(st.session_state.obstacles_gcj)}")
