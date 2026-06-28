@@ -10,7 +10,8 @@ import io
 from datetime import datetime, timedelta
 import copy
 import heapq
-import numpy np
+# 修复语法错误：补充as关键字
+import numpy as np
 # 新增MAVLink通信依赖
 from pymavlink import mavutil
 
@@ -121,8 +122,8 @@ def transform_lat(lng, lat):
 def transform_lng(lng, lat):
     ret = 300.0 + lng + 2.0 * lat + 0.1 * lng * lng + 0.1 * lng * lat + 0.1 * math.sqrt(abs(lng))
     ret += (20.0 * math.sin(6.0 * lng * math.pi) + 20.0 * math.sin(2.0 * lng * math.pi)) * 2.0 / 3.0
-    ret += (20.0 * math.sin(lat * math.pi) + 40.0 * math.sin(lat / 3.0 * math.pi)) * 2.0 / 3.0
-    ret += (150.0 * math.sin(lat / 12.0 * math.pi) + 300.0 * math.sin(lat / 30.0 * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(lng * math.pi) + 40.0 * math.sin(lng / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (150.0 * math.sin(lng / 12.0 * math.pi) + 300.0 * math.sin(lng / 30.0 * math.pi)) * 2.0 / 3.0
     return ret
 
 def out_of_china(lng, lat):
@@ -328,7 +329,7 @@ def astar_path(start, end, obstacles_gcj, flight_height, safe_radius):
                 dx2 /= l2
                 dy2 /= l2
             nx2 = x + dx2*safety
-            ny2 = y + dy2
+            ny2 = y + dy2*safety
             nodes.append([nx1, ny1])
             nodes.append([nx2, ny2])
     unique_nodes = []
@@ -391,7 +392,7 @@ def create_avoidance_path(start, end, obstacles_gcj, flight_height, safe_radius,
         return path
     if strategy == 'left':
         add_gcs_obc_fcu_log(f"开始航线规划 | 类型:向左绕行 | 飞行高度:{flight_height}m")
-        p = generate_side_bypass_path(start, end, obstacles_gcj, flight_height, 'left')
+        p = generate_side_bypass_path(start, end, obstacles_gcj, flight_height, safe_radius, 'left')
         if p and len(p)>=2:
             add_gcs_obc_fcu_log(f"航线规划完成 | 向左绕行成功 | 航点数:{len(p)} | 长度:{calc_path_total_m(p)}m")
             return p
@@ -401,8 +402,8 @@ def create_avoidance_path(start, end, obstacles_gcj, flight_height, safe_radius,
             add_gcs_obc_fcu_log(f"A*规划完成 | 航点数:{len(ast_p)} | 长度:{calc_path_total_m(ast_p)}m")
             return ast_p
     elif strategy == 'right':
-        add_gcs_obc_fcu_log(f"开始航线规划 | 类型:向右绕行 | 飞行高度:{flight_height}")
-        p = generate_side_bypass_path(start, end, obstacles_gcj, flight_height, 'right')
+        add_gcs_obc_fcu_log(f"开始航线规划 | 类型:向右绕行 | 飞行高度:{flight_height}m")
+        p = generate_side_bypass_path(start, end, obstacles_gcj, flight_height, safe_radius, 'right')
         if p and len(p)>=2:
             add_gcs_obc_fcu_log(f"航线规划完成 | 向右绕行成功 | 航点数:{len(p)} | 长度:{calc_path_total_m(p)}m")
             return p
@@ -667,7 +668,7 @@ def create_planning_map(center_gcj, points_gcj, obstacles_gcj, flight_history=No
     if points_gcj.get('A') and points_gcj.get('B'):
         line_color = "blue" if not straight_blocked else "gray"
         dash_pop = "直线畅通" if not straight_blocked else "⚠️直线被阻挡"
-        folium.PolyLine([[points_gcj['A'][1], points_gcj['A'][0]], [points_gcj['B'][1], points_gcj[0]]], color=line_color, weight=2, opacity=0.5, dash_array="5,5", popup=dash_pop).add_to(m)
+        folium.PolyLine([[points_gcj['A'][1], points_gcj['A'][0]], [points_gcj['B'][1], points_gcj['B'][0]]], color=line_color, weight=2, opacity=0.5, dash_array="5,5", popup=dash_pop).add_to(m)
     if flight_history and len(flight_history)>1:
         trail = [[p[1], p[0]] for p in flight_history]
         folium.PolyLine(trail, color="orange", weight=2, opacity=0.6, popup="实时飞行轨迹").add_to(m)
@@ -752,7 +753,7 @@ def main():
             if st.button("➕添加障碍物（地图圈选）", use_container_width=True):
                 if st.session_state.pending_polygon and len(st.session_state.pending_polygon)>=3:
                     st.session_state.obstacles_gcj.append({
-                        "name": f"建筑物{len(st.session_state.obstacles_gcj)}",
+                        "name": f"建筑物{len(st.session_state.obstacles_gcj)+1}",
                         "polygon": st.session_state.pending_polygon,
                         "height": st.session_state.pending_height
                     })
@@ -796,14 +797,14 @@ def main():
                     if len(poly_gcj)>=3:
                         st.session_state.pending_polygon = poly_gcj
                         st.success("已捕获多边形障碍物轮廓")
-    # ========== 页面2：飞行监控（【新增MAVLink控制面板+报文面板，对应报告图3.20~3.23】） ==========
+    # ========== 页面2：飞行监控（MAVLink通信接口完整面板） ==========
     elif page == "📡 飞行监控":
         st.header("🛸 飞行实时画面 - 任务执行监控")
-        # 新增MAVLink连接控制区（图3.20界面）
+        # MAVLink通信接口设置面板（报告图3.20）
         with st.expander("📶 MAVLink通信接口设置（适配PX4 SITL UDP 14550）", expanded=True):
             conn_col1, conn_col2, conn_col3 = st.columns([2,1,1])
             udp_ip = conn_col1.text_input("飞控UDP地址", value="127.0.0.1")
-            udp_port = conn_col2.number_input("端口号", value=14550, min=1000, max=60000)
+            udp_port = conn_col2.number_input("端口号", value=14550, min_value=1000, max_value=60000)
             conn_status = st.session_state.mav_conn is not None
             if conn_status:
                 conn_col3.success("✅ 链路已连接")
@@ -818,11 +819,11 @@ def main():
                 if st.button("断开通信链路", use_container_width=True):
                     disconnect_mavlink()
                     st.rerun()
-            # 报文筛选下拉框（报告图3.20右侧下拉选择）
+            # 报文类型下拉选择
             msg_type_list = ["HEARTBEAT","SYS_STATUS","VFR_HUD","ATTITUDE","GLOBAL_POSITION_INT","POWER_STATUS"]
             sel_msg = st.selectbox("选择查看MAV报文类型", msg_type_list, index=0)
             st.session_state.mav_msg_type = sel_msg
-            # 定时抓取报文缓存
+            # 实时抓取报文
             fetch_mavlink_msg()
             show_msg = get_cached_mav_msg(sel_msg)
             if show_msg:
@@ -854,7 +855,7 @@ def main():
         with ctrl_row[1]:
             run_status = "运行中" if (st.session_state.simulation_running and not st.session_state.heartbeat_sim.paused) else "已暂停"
             st.info(f"仿真状态：{run_status}")
-        # 固定3秒自动刷新读取MAV数据
+        # 3秒自动刷新读取MAV数据
         now_time = time.time()
         refresh_interval = 3.0
         auto_refresh = False
@@ -869,7 +870,7 @@ def main():
                 auto_refresh = True
         if auto_refresh:
             st.rerun()
-        # 状态指标（图3.21 模拟/真实数据仪表盘）
+        # 飞行数据仪表盘（图3.21/3.22，兼容真实MAV/模拟数据）
         if st.session_state.heartbeat_sim.history:
             latest = st.session_state.heartbeat_sim.history[0]
             metric_cols = st.columns(6)
